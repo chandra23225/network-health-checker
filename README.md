@@ -17,11 +17,23 @@ configured resolver.
 
 ## Usage
 
+### PowerShell
+
 ```powershell
 python network_health_check.py `
   --ping-host <host-to-ping> `
   --iperf-host <iperf3-server> `
   --dns-name <name-to-resolve> `
+  --min-throughput-mbps 10
+```
+
+### Bash (Linux/macOS)
+
+```bash
+python3 network_health_check.py \
+  --ping-host <host-to-ping> \
+  --iperf-host <iperf3-server> \
+  --dns-name <name-to-resolve> \
   --min-throughput-mbps 10
 ```
 
@@ -63,6 +75,30 @@ The checker prints one line per check. It exits with:
 
 Missing commands, failed network checks, subprocess timeouts, and invalid
 iperf3 output are reported explicitly as failures.
+
+### Sample output
+
+These examples illustrate the report format; the addresses and throughput
+values are sample data.
+
+All checks pass:
+
+```text
+[PASS] Ping: 192.0.2.1 responded to 4 ping request(s)
+[PASS] iperf3: 42.50 Mbps received (minimum 10.00 Mbps)
+[PASS] DNS: example.com resolved to 93.184.216.34
+```
+
+One or more checks fail:
+
+```text
+[PASS] Ping: 192.0.2.1 responded to 4 ping request(s)
+[FAIL] iperf3: 42.50 Mbps received (minimum 50.00 Mbps)
+[FAIL] DNS: expected 192.0.2.53 for example.com; resolved: 93.184.216.34
+```
+
+The all-PASS example exits with status `0`; the example with failures exits
+with status `1`.
 
 ## Project
 

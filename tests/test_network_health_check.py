@@ -5,9 +5,11 @@ import platform
 import socket
 import subprocess
 import unittest
-from unittest.mock import patch
+import urllib.error
+import urllib.request
+from unittest.mock import MagicMock, patch
 
-from network_health_check import CheckResult, main, run_dns, run_iperf, run_ping
+from network_health_check import CheckResult, main, run_dns, run_http, run_iperf, run_ping
 
 
 class PingTests(unittest.TestCase):
@@ -190,30 +192,121 @@ class DnsTests(unittest.TestCase):
         self.assertIn("name not found", result.detail)
 
 
+class HttpTests(unittest.TestCase):
+    """Tests for run_http — all network I/O is mocked via urllib.request.urlopen."""
+
+    @staticmethod
+    def _mock_response(status):
+        response = MagicMock()
+        response.status = status
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        return response
+
+    @patch("network_health_check.urllib.request.urlopen")
+    def test_http_passes_on_200(self, urlopen):
+        urlopen.return_value = self._mock_response(200)
+
+        result = run_http("https://example.com")
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.name, "HTTP")
+        self.assertIn("200", result.detail)
+
+    @patch("network_health_check.urllib.request.urlopen")
+    def test_http_passes_on_any_2xx(self, urlopen):
+        for status in (201, 204, 206):
+            with self.subTest(status=status):
+                urlopen.return_value = self._mock_response(status)
+                result = run_http("https://example.com")
+                self.assertTrue(result.passed)
+
+    @patch("network_health_check.urllib.request.urlopen")
+    def test_http_fails_on_server_error(self, urlopen):
+        urlopen.side_effect = urllib.error.HTTPError(
+            url="https://example.com",
+            code=503,
+            msg="Service Unavailable",
+            hdrs=None,
+            fp=None,
+        )
+
+        result = run_http("https://example.com")
+
+        self.assertFalse(result.passed)
+        self.assertIn("503", result.detail)
+
+    @patch("network_health_check.urllib.request.urlopen")
+    def test_http_passes_when_expected_status_matches(self, urlopen):
+        urlopen.side_effect = urllib.error.HTTPError(
+            url="https://example.com",
+            code=301,
+            msg="Moved Permanently",
+            hdrs=None,
+            fp=None,
+        )
+
+        result = run_http("https://example.com", expected_status=301)
+
+        self.assertTrue(result.passed)
+        self.assertIn("301", result.detail)
+
+    @patch("network_health_check.urllib.request.urlopen")
+    def test_http_fails_when_expected_status_does_not_match(self, urlopen):
+        urlopen.return_value = self._mock_response(200)
+
+        result = run_http("https://example.com", expected_status=204)
+
+        self.assertFalse(result.passed)
+        self.assertIn("200", result.detail)
+        self.assertIn("204", result.detail)
+
+    @patch(
+        "network_health_check.urllib.request.urlopen",
+        side_effect=urllib.error.URLError("connection refused"),
+    )
+    def test_http_fails_on_url_error(self, _urlopen):
+        result = run_http("https://example.com")
+
+        self.assertFalse(result.passed)
+        self.assertIn("connection refused", result.detail)
+
+    @patch(
+        "network_health_check.urllib.request.urlopen",
+        side_effect=TimeoutError(),
+    )
+    def test_http_fails_on_timeout(self, _urlopen):
+        result = run_http("https://example.com", timeout_seconds=5)
+
+        self.assertFalse(result.passed)
+        self.assertIn("timed out", result.detail.lower())
+
+
 class CliTests(unittest.TestCase):
     arguments = [
-        "--ping-host",
-        "router.example",
-        "--iperf-host",
-        "iperf.example",
-        "--dns-name",
-        "service.example",
+        "--ping-host", "router.example",
+        "--iperf-host", "iperf.example",
+        "--dns-name", "service.example",
     ]
+
+    def _all_pass_patches(self):
+        return (
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", True, "12.00 Mbps")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
+        )
 
     def test_main_reports_all_pass_and_returns_zero(self):
         with (
-            patch(
-                "network_health_check.run_ping",
-                return_value=CheckResult("Ping", True, "reachable"),
-            ),
-            patch(
-                "network_health_check.run_iperf",
-                return_value=CheckResult("iperf3", True, "12.00 Mbps"),
-            ),
-            patch(
-                "network_health_check.run_dns",
-                return_value=CheckResult("DNS", True, "192.0.2.5"),
-            ),
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", True, "12.00 Mbps")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
         ):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -224,18 +317,12 @@ class CliTests(unittest.TestCase):
 
     def test_main_reports_failure_and_returns_one(self):
         with (
-            patch(
-                "network_health_check.run_ping",
-                return_value=CheckResult("Ping", True, "reachable"),
-            ),
-            patch(
-                "network_health_check.run_iperf",
-                return_value=CheckResult("iperf3", False, "server unavailable"),
-            ),
-            patch(
-                "network_health_check.run_dns",
-                return_value=CheckResult("DNS", True, "192.0.2.5"),
-            ),
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", False, "server unavailable")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
         ):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -252,6 +339,7 @@ class CliTests(unittest.TestCase):
             ("--iperf-port", "65536"),
             ("--min-throughput-mbps", "-1"),
             ("--expected-dns-ip", "not-an-ip"),
+            ("--http-url", "ftp://example.com"),
         )
         for option, value in invalid_options:
             with self.subTest(option=option):
@@ -261,6 +349,99 @@ class CliTests(unittest.TestCase):
                         main(self.arguments + [option, value])
                 self.assertEqual(error.exception.code, 2)
                 self.assertIn("error:", stderr.getvalue())
+
+    def test_main_runs_http_check_when_url_provided(self):
+        with (
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", True, "12.00 Mbps")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
+            patch("network_health_check.run_http",
+                  return_value=CheckResult("HTTP", True, "https://example.com returned HTTP 200")) as mock_http,
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = main(self.arguments + ["--http-url", "https://example.com"])
+
+        self.assertEqual(status, 0)
+        mock_http.assert_called_once()
+        self.assertEqual(output.getvalue().count("[PASS]"), 4)
+
+    def test_main_skips_http_check_when_url_not_provided(self):
+        with (
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", True, "12.00 Mbps")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
+            patch("network_health_check.run_http") as mock_http,
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                main(self.arguments)
+
+        mock_http.assert_not_called()
+
+    # ── JSON output mode ──────────────────────────────────────────────────────
+
+    def test_json_output_is_valid_json(self):
+        with (
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", True, "12.00 Mbps")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                main(self.arguments + ["--output", "json"])
+
+        parsed = json.loads(output.getvalue())
+        self.assertIn("results", parsed)
+        self.assertIn("passed", parsed)
+        self.assertTrue(parsed["passed"])
+        self.assertEqual(len(parsed["results"]), 3)
+
+    def test_json_output_marks_overall_passed_false_on_any_failure(self):
+        with (
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", False, "too slow")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = main(self.arguments + ["--output", "json"])
+
+        parsed = json.loads(output.getvalue())
+        self.assertFalse(parsed["passed"])
+        self.assertEqual(status, 1)
+
+    def test_json_output_contains_expected_fields_per_result(self):
+        with (
+            patch("network_health_check.run_ping",
+                  return_value=CheckResult("Ping", True, "reachable")),
+            patch("network_health_check.run_iperf",
+                  return_value=CheckResult("iperf3", True, "12.00 Mbps")),
+            patch("network_health_check.run_dns",
+                  return_value=CheckResult("DNS", True, "192.0.2.5")),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                main(self.arguments + ["--output", "json"])
+
+        parsed = json.loads(output.getvalue())
+        for item in parsed["results"]:
+            self.assertIn("name", item)
+            self.assertIn("passed", item)
+            self.assertIn("detail", item)
+            self.assertIsInstance(item["passed"], bool)
 
 
 if __name__ == "__main__":

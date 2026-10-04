@@ -5,6 +5,8 @@ import math
 import platform
 import socket
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
@@ -63,9 +65,15 @@ def _ip_address(value):
         raise argparse.ArgumentTypeError("must be a valid IPv4 or IPv6 address") from error
 
 
+def _http_url(value):
+    if not value.startswith(("http://", "https://")):
+        raise argparse.ArgumentTypeError("must start with http:// or https://")
+    return value
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
-        description="Check host reachability, iperf3 throughput, and DNS resolution."
+        description="Check host reachability, iperf3 throughput, DNS resolution, and HTTP/HTTPS connectivity."
     )
     parser.add_argument("--ping-host", required=True, help="host to test with ping")
     parser.add_argument("--iperf-host", required=True, help="iperf3 server host")
@@ -98,6 +106,22 @@ def _build_parser():
         "--expected-dns-ip",
         type=_ip_address,
         help="require this IP address to appear in DNS results",
+    )
+    parser.add_argument(
+        "--http-url",
+        type=_http_url,
+        help="HTTP or HTTPS URL to check for a successful response (2xx status)",
+    )
+    parser.add_argument(
+        "--http-status",
+        type=_positive_int,
+        help="require this exact HTTP status code (default: any 2xx)",
+    )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json"],
+        default="text",
+        help="output format: text (default) or json",
     )
     return parser
 
@@ -196,6 +220,53 @@ def run_dns(name, expected_ip: Optional[str] = None):
     return CheckResult("DNS", True, f"{name} resolved to {', '.join(addresses)}")
 
 
+def run_http(url, expected_status: Optional[int] = None, timeout_seconds: float = 15):
+    """Perform an HTTP/HTTPS GET request and check the response status code.
+
+    Passes when the response is 2xx (or matches ``expected_status`` exactly).
+    Redirects are followed automatically by urllib.
+    """
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("User-Agent", "network-health-check/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    except TimeoutError:
+        return CheckResult("HTTP", False, f"HTTP request timed out after {timeout_seconds:g}s")
+    except urllib.error.URLError as error:
+        return CheckResult("HTTP", False, f"could not reach {url}: {error.reason}")
+    except OSError as error:
+        return CheckResult("HTTP", False, f"could not reach {url}: {error}")
+
+    if expected_status is not None:
+        passed = status == expected_status
+        detail = f"{url} returned HTTP {status} (expected {expected_status})"
+    else:
+        passed = 200 <= status < 300
+        detail = f"{url} returned HTTP {status}"
+
+    return CheckResult("HTTP", passed, detail)
+
+
+def _print_text(results):
+    for result in results:
+        status = "PASS" if result.passed else "FAIL"
+        print(f"[{status}] {result.name}: {result.detail}")
+
+
+def _print_json(results):
+    output = {
+        "results": [
+            {"name": r.name, "passed": r.passed, "detail": r.detail}
+            for r in results
+        ],
+        "passed": all(r.passed for r in results),
+    }
+    print(json.dumps(output, indent=2))
+
+
 def main(argv=None):
     args = _build_parser().parse_args(argv)
     results = [
@@ -208,9 +279,17 @@ def main(argv=None):
         ),
         run_dns(args.dns_name, args.expected_dns_ip),
     ]
-    for result in results:
-        status = "PASS" if result.passed else "FAIL"
-        print(f"[{status}] {result.name}: {result.detail}")
+
+    if args.http_url:
+        results.append(
+            run_http(args.http_url, args.http_status, args.timeout)
+        )
+
+    if args.output == "json":
+        _print_json(results)
+    else:
+        _print_text(results)
+
     return 0 if all(result.passed for result in results) else 1
 
 
